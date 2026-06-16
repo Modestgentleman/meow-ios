@@ -10,8 +10,10 @@
 //!                                          rules / proxies / DNS / REST API
 //!
 //! No SOCKS5 loopback sits between tun2socks and the engine; the staticlib
-//! owns a single tokio runtime that both halves share. DNS is delegated
-//! end-to-end to meow's resolver running in fake-IP mode: the tun2socks
+//! owns separate tokio runtimes for the packet/netstack driver and for meow
+//! engine work so lwIP backpressure cannot starve the REST/API/proxy workers.
+//! DNS is delegated end-to-end to meow's resolver running in fake-IP mode: the
+//! tun2socks
 //! UDP/53 intercept answers AAAA queries NOERROR-empty itself (forcing
 //! clients onto the proxied IPv4 fake-IP path) and hands A queries straight
 //! to `meow_dns::DnsServer::handle_query`, which synthesises the fake-IP,
@@ -24,6 +26,7 @@
 
 mod diagnostics;
 mod engine;
+mod file_log;
 mod logging;
 pub mod rss;
 mod subscription;
@@ -48,35 +51,77 @@ use std::time::Duration;
 // Global state
 // ---------------------------------------------------------------------------
 
-static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static ENGINE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TUN2SOCKS_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-pub(crate) fn get_runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| {
-        // Four worker threads. Raised from two: the lwIP netstack is
-        // serialized by a single spinning `LWIP_MUTEX`, and with only two
-        // workers a contender that spins on it (via `std::thread::yield_now`,
-        // which yields the OS thread but not the tokio scheduler) can starve
-        // the lock holder under a startup connection burst, wedging the whole
-        // runtime. More workers widen that window so a stuck pair can't halt
-        // all forward progress.
+fn build_runtime(
+    name: &'static str,
+    worker_threads: usize,
+    stack_size: usize,
+) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name(name)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("failed to create {name} tokio runtime: {e}"))
+}
+
+pub(crate) fn get_engine_runtime() -> &'static tokio::runtime::Runtime {
+    ENGINE_RUNTIME.get_or_init(|| {
+        // Meow engine work includes REST/API, config validation, DNS resolver,
+        // proxy dials, TLS, and serde. Keep two workers so heavy proxy/API
+        // bursts can overlap without sharing workers with the lwIP stack.
         //
         // Stack size is 1 MiB (tokio's default is 2 MiB). This is a *virtual*
         // limit, not a resident allocation: Darwin demand-pages thread stacks,
-        // so RSS tracks the deepest poll actually executed, not the cap — a
-        // bigger cap costs no memory unless the code genuinely recurses into
-        // it. The previous 512 KiB cap therefore saved no RSS while risking a
-        // stack-overflow crash on the deepest real frames: a BoringSSL/rustls
-        // handshake (100–200 KiB on its own) nested inside a multi-layer
-        // transport chain (e.g. VLESS-over-WS-over-TLS-over-ECH) plus the
-        // relay's `copy_bidirectional` combinator frames. 1 MiB gives
-        // comfortable headroom over that worst case while staying conservative.
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_stack_size(1024 * 1024)
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
+        // so RSS tracks the deepest poll actually executed, not the cap. The
+        // deeper real frames are on this runtime: BoringSSL/rustls handshakes
+        // inside layered transports plus relay combinator frames.
+        build_runtime("meow-engine", 2, 1024 * 1024)
     })
+}
+
+pub(crate) fn get_tun2socks_runtime() -> &'static tokio::runtime::Runtime {
+    TUN2SOCKS_RUNTIME.get_or_init(|| {
+        // Tun2socks owns packet ingress/egress, lwIP stack driving, and
+        // accept-loop bookkeeping. It deliberately does not run meow proxy
+        // dials or REST/API tasks.
+        //
+        // Four worker threads: the lwIP netstack is serialized by a spinning
+        // `LWIP_MUTEX`, and with only two workers a contender that spins on it
+        // can starve the lock holder under a startup connection burst. More
+        // workers widen that window so a stuck pair can't halt all tun2socks
+        // progress.
+        build_runtime("meow-tun2socks", 4, 1024 * 1024)
+    })
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    fn runtime_worker_name(rt: &tokio::runtime::Runtime) -> String {
+        rt.block_on(async {
+            tokio::spawn(async {
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string()
+            })
+            .await
+            .expect("runtime worker name task")
+        })
+    }
+
+    #[test]
+    fn engine_and_tun2socks_use_distinct_tokio_worker_pools() {
+        let engine = runtime_worker_name(crate::get_engine_runtime());
+        let tun2socks = runtime_worker_name(crate::get_tun2socks_runtime());
+
+        assert_eq!(engine, "meow-engine");
+        assert_eq!(tun2socks, "meow-tun2socks");
+        assert_ne!(engine, tun2socks);
+    }
 }
 
 pub(crate) static HOME_DIR: Mutex<Option<String>> = Mutex::new(None);
@@ -122,6 +167,30 @@ pub extern "C" fn meow_core_init() {
     logging::init_os_logger();
     logging::install_panic_hook();
     logging::bridge_log("meow_core_init: os_log initialized");
+}
+
+/// Emit a log line from the NetworkExtension host (ObjC) into the same tracing
+/// pipeline the engine uses, so NE lifecycle events — start/stop, sleep/wake,
+/// `reasserting`, errors — land in the App Group file log (and os_log, and the
+/// REST `/logs` stream) interleaved with engine output on one timeline.
+///
+/// `level`: 0 = error, 1 = warn, 2 = info, 3 = debug, 4 = trace; anything else
+/// is treated as info. No-op on a NULL or non-UTF-8 `msg`.
+///
+/// # Safety
+/// `msg` must point to a NUL-terminated UTF-8 string or be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_core_log(level: c_int, msg: *const c_char) {
+    let Some(text) = cstr_to_str(msg) else {
+        return;
+    };
+    match level {
+        0 => tracing::error!(target: "ne", "{}", text),
+        1 => tracing::warn!(target: "ne", "{}", text),
+        3 => tracing::debug!(target: "ne", "{}", text),
+        4 => tracing::trace!(target: "ne", "{}", text),
+        _ => tracing::info!(target: "ne", "{}", text),
+    }
 }
 
 /// Set the app-group container path where config.yaml and cache files live.
@@ -310,7 +379,7 @@ pub unsafe extern "C" fn meow_engine_test_direct_tcp(
         return -1;
     };
     let to = Duration::from_millis(timeout_ms.max(1) as u64);
-    let result = get_runtime().block_on(diagnostics::test_direct_tcp(h, port as u16, to));
+    let result = get_engine_runtime().block_on(diagnostics::test_direct_tcp(h, port as u16, to));
     match result {
         Ok(elapsed) => {
             if !out_ms.is_null() {
@@ -345,7 +414,7 @@ pub unsafe extern "C" fn meow_engine_test_proxy_http(
         return -1;
     };
     let to = Duration::from_millis(timeout_ms.max(1) as u64);
-    let result = get_runtime().block_on(diagnostics::test_proxy_http(&tunnel, u, to));
+    let result = get_engine_runtime().block_on(diagnostics::test_proxy_http(&tunnel, u, to));
     match result {
         Ok((status, elapsed)) => {
             if !out_status.is_null() {
@@ -385,7 +454,7 @@ pub unsafe extern "C" fn meow_engine_test_dns(
         return -1;
     };
     let to = Duration::from_millis(timeout_ms.max(1) as u64);
-    match get_runtime().block_on(diagnostics::test_dns(&tunnel, h, to)) {
+    match get_engine_runtime().block_on(diagnostics::test_dns(&tunnel, h, to)) {
         Ok(ips) => {
             use std::fmt::Write;
             let mut joined = String::new();
@@ -654,9 +723,10 @@ pub unsafe extern "C" fn meow_patch_config(
 // tun2socks (NEPacketTunnelFlow bridge) — dispatches in-process into engine
 // ---------------------------------------------------------------------------
 
-/// C-compatible egress callback. Called from the tokio runtime whenever
-/// tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`. Swift
-/// guarantees `ctx` remains live between `meow_tun_start` and `meow_tun_stop`.
+/// C-compatible egress callback. Called from the tun2socks tokio runtime
+/// whenever tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`.
+/// Swift guarantees `ctx` remains live between `meow_tun_start` and
+/// `meow_tun_stop`.
 pub type MeowWritePacket =
     unsafe extern "C" fn(ctx: *mut std::os::raw::c_void, data: *const u8, len: usize);
 
@@ -724,11 +794,9 @@ pub extern "C" fn meow_tun_stop_blocking() {
     tun2socks::stop_blocking();
 }
 
-/// Abort every in-flight TCP flow tracked by tun2socks. Used by the iOS
-/// PacketTunnel side when the underlying network interface changes
-/// (Wi-Fi → cellular, etc.) and we want to drop stale flows so they
-/// re-dial against the new uplink, **without** tearing down the engine
-/// or the TUN itself.
+/// Abort every in-flight TCP flow tracked by tun2socks. This is an
+/// emergency diagnostic/teardown hook for dropping stale flows without
+/// tearing down the engine or the TUN itself.
 ///
 /// Each abort cancels the dispatch_tcp future, which drops the netstack
 /// stream side and (via `ConnectionGuard::drop` inside meow-tunnel)
@@ -874,6 +942,32 @@ pub extern "C" fn meow_tun_set_tcp_idle_ttl_ms(ms: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn meow_tun_tcp_idle_ttl_ms() -> c_int {
     tun2socks::tcp_idle_ttl_ms() as c_int
+}
+
+/// Enable or disable "block HTTP/3 (QUIC)". Default OFF (0): current
+/// behaviour is preserved. When enabled (non-zero) the tunnel drops
+/// outbound UDP datagrams to destination port 443 (QUIC's transport) and
+/// answers SVCB (64) / HTTPS (65) DNS queries NOERROR-empty from the
+/// intercept itself (no h3/SvcParams advertisement), forcing clients onto
+/// the A / fake-IPv4 + TCP path.
+///
+/// At the FFI layer the new value applies immediately to subsequent UDP
+/// datagrams and DNS queries (the backing flag is a plain atomic). The
+/// meow-ios app only invokes this at tunnel start, so toggling the user
+/// preference applies on the next tunnel (re)connect — same as allowLan.
+///
+/// Returns 0 unconditionally.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_block_http3(enabled: c_int) -> c_int {
+    tun2socks::set_block_http3(enabled != 0);
+    0
+}
+
+/// Read whether "block HTTP/3 (QUIC)" is currently enabled. Returns 1 if
+/// enabled, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn meow_tun_block_http3() -> c_int {
+    c_int::from(tun2socks::block_http3())
 }
 
 /// Resident memory size of the FFI's containing process, in bytes. Same

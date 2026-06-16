@@ -13,9 +13,10 @@
 #include <stdlib.h>
 
 /**
- * C-compatible egress callback. Called from the tokio runtime whenever
- * tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`. Swift
- * guarantees `ctx` remains live between `meow_tun_start` and `meow_tun_stop`.
+ * C-compatible egress callback. Called from the tun2socks tokio runtime
+ * whenever tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`.
+ * Swift guarantees `ctx` remains live between `meow_tun_start` and
+ * `meow_tun_stop`.
  */
 typedef void (*MeowWritePacket)(void *ctx, const uint8_t *data, uintptr_t len);
 
@@ -23,6 +24,20 @@ typedef void (*MeowWritePacket)(void *ctx, const uint8_t *data, uintptr_t len);
  * Initialize logging. Safe to call more than once.
  */
 void meow_core_init(void);
+
+/**
+ * Emit a log line from the NetworkExtension host (ObjC) into the same tracing
+ * pipeline the engine uses, so NE lifecycle events — start/stop, sleep/wake,
+ * `reasserting`, errors — land in the App Group file log (and os_log, and the
+ * REST `/logs` stream) interleaved with engine output on one timeline.
+ *
+ * `level`: 0 = error, 1 = warn, 2 = info, 3 = debug, 4 = trace; anything else
+ * is treated as info. No-op on a NULL or non-UTF-8 `msg`.
+ *
+ * # Safety
+ * `msg` must point to a NUL-terminated UTF-8 string or be NULL.
+ */
+void meow_core_log(int level, const char *msg);
 
 /**
  * Set the app-group container path where config.yaml and cache files live.
@@ -211,11 +226,9 @@ void meow_tun_stop(void);
 void meow_tun_stop_blocking(void);
 
 /**
- * Abort every in-flight TCP flow tracked by tun2socks. Used by the iOS
- * PacketTunnel side when the underlying network interface changes
- * (Wi-Fi → cellular, etc.) and we want to drop stale flows so they
- * re-dial against the new uplink, **without** tearing down the engine
- * or the TUN itself.
+ * Abort every in-flight TCP flow tracked by tun2socks. This is an
+ * emergency diagnostic/teardown hook for dropping stale flows without
+ * tearing down the engine or the TUN itself.
  *
  * Each abort cancels the dispatch_tcp future, which drops the netstack
  * stream side and (via `ConnectionGuard::drop` inside meow-tunnel)
@@ -327,6 +340,29 @@ int meow_tun_set_tcp_idle_ttl_ms(int ms);
  * means the sweeper is disabled.
  */
 int meow_tun_tcp_idle_ttl_ms(void);
+
+/**
+ * Enable or disable "block HTTP/3 (QUIC)". Default OFF (0): current
+ * behaviour is preserved. When enabled (non-zero) the tunnel drops
+ * outbound UDP datagrams to destination port 443 (QUIC's transport) and
+ * answers SVCB (64) / HTTPS (65) DNS queries NOERROR-empty from the
+ * intercept itself (no h3/SvcParams advertisement), forcing clients onto
+ * the A / fake-IPv4 + TCP path.
+ *
+ * At the FFI layer the new value applies immediately to subsequent UDP
+ * datagrams and DNS queries (the backing flag is a plain atomic). The
+ * meow-ios app only invokes this at tunnel start, so toggling the user
+ * preference applies on the next tunnel (re)connect — same as allowLan.
+ *
+ * Returns 0 unconditionally.
+ */
+int meow_tun_set_block_http3(int enabled);
+
+/**
+ * Read whether "block HTTP/3 (QUIC)" is currently enabled. Returns 1 if
+ * enabled, 0 otherwise.
+ */
+int meow_tun_block_http3(void);
 
 /**
  * Resident memory size of the FFI's containing process, in bytes. Same

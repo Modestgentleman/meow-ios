@@ -91,8 +91,8 @@ static TUN2SOCKS_RUNNING: AtomicBool = AtomicBool::new(false);
 // Monotonic instance id. `start()` bumps it; the spawned run task captures
 // its own value and only performs end-of-life cleanup (clearing
 // `ingress_slot`, lowering `TUN2SOCKS_RUNNING`) if it is STILL the current
-// generation. Without the guard, a rapid stop()→start() (sleep/wake +
-// path-change churn both restart tun2socks back-to-back) let the OLD task's
+// generation. Without the guard, a rapid stop()→start() (sleep/wake can
+// restart tun2socks back-to-back) let the OLD task's
 // deferred cleanup steal the NEW instance's ingress sender and flag:
 // `stop()` is fire-and-forget, so the old task was still parked in `recv()`
 // when the new one started, and its teardown ran arbitrarily later.
@@ -231,6 +231,38 @@ pub fn set_udp_first_reply_deadline_ms(ms: u64) -> bool {
 /// milliseconds. `0` means the watchdog is disabled.
 pub fn udp_first_reply_deadline_ms() -> u64 {
     UDP_FIRST_REPLY_DEADLINE_MS.load(Ordering::Relaxed)
+}
+
+// "Block HTTP/3 (QUIC)" toggle. Default OFF — current behaviour is preserved
+// unless Swift flips it. When ON the tunnel cuts HTTP/3 off at two layers that
+// reinforce each other:
+//
+//   1. UDP egress to dst:443 is dropped (QUIC's transport), killing any QUIC
+//      handshake that still attempts a connection.
+//   2. SVCB (64) / HTTPS (65) DNS queries are answered NOERROR-empty by the
+//      intercept itself instead of being forwarded to meow-dns, so the client
+//      never learns the HTTP/3 `alpn`/SvcParams and falls back to A / fake-IPv4
+//      over TCP.
+//
+// Both prongs are wired to this single flag. Stored Relaxed — the toggle has no
+// ordering relationship with other state; a stale read for one datagram is
+// harmless.
+static BLOCK_HTTP3: AtomicBool = AtomicBool::new(false);
+
+/// Throttle slot for the QUIC/HTTP3 UDP-drop log (dst:443 dropped while the
+/// block-HTTP3 toggle is on). Throttled via `warn_capped` to once per second so
+/// a QUIC-heavy app doesn't flood the on-device log.
+static BLOCK_HTTP3_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Enable or disable the "block HTTP/3 (QUIC)" behaviour. Default OFF. Returns
+/// true unconditionally.
+pub fn set_block_http3(on: bool) {
+    BLOCK_HTTP3.store(on, Ordering::Relaxed);
+}
+
+/// Read whether the "block HTTP/3 (QUIC)" behaviour is currently enabled.
+pub fn block_http3() -> bool {
+    BLOCK_HTTP3.load(Ordering::Relaxed)
 }
 
 // Per-TCP-flow idle TTL. Closes the wedge the dial deadline can't reach:
@@ -548,7 +580,7 @@ pub fn start(ctx: *mut c_void, cb: WritePacketFn) -> Result<(), String> {
     // teardown before touching the lwip globals.
     let prev = run_handle_slot().lock().take();
 
-    let rt = crate::get_runtime();
+    let rt = crate::get_tun2socks_runtime();
     let handle = rt.spawn(async move {
         if let Some(prev) = prev {
             // `stop()` is fire-and-forget: the previous run task may still
@@ -608,7 +640,7 @@ pub fn stop() {
 /// the previous teardown via `run_handle_slot`).
 ///
 /// MUST be called from a NON-runtime thread (the Swift control queue): it
-/// `block_on`s the shared runtime. Bounded by `JOIN_TIMEOUT` so a
+/// `block_on`s the tun2socks runtime. Bounded by `JOIN_TIMEOUT` so a
 /// pathological teardown hang can't freeze iOS's `stopTunnel` grace window;
 /// if the bound trips we log and return anyway (a hung teardown is a separate
 /// failure, and freezing shutdown is worse than a vanishingly-rare late
@@ -619,7 +651,7 @@ pub fn stop_blocking() {
         return;
     };
     const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    crate::get_runtime().block_on(async move {
+    crate::get_tun2socks_runtime().block_on(async move {
         match tokio::time::timeout(JOIN_TIMEOUT, handle).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -744,6 +776,7 @@ async fn run_tun2socks(
 
     let tcp_accept_sem_for_task = tcp_accept_sem.clone();
     let tcp_flow_tasks_for_accept = tcp_flow_tasks.clone();
+    let engine_handle_for_tcp = crate::get_engine_runtime().handle().clone();
     let tcp_accept_handle = tokio::spawn(async move {
         let cap_warn_last = AtomicU64::new(0);
         while let Some((stream, local_addr, remote_addr)) = tcp_listener.next().await {
@@ -797,11 +830,14 @@ async fn run_tun2socks(
                 last_active_ms: AtomicU64::new(now_ms()),
             });
             let state_for_task = state.clone();
-            let task = tcp_flow_tasks_for_accept.spawn(async move {
-                let _permit = permit;
-                dispatch_tcp(stream, local_addr, remote_addr, state_for_task).await;
-                tcp_flows().remove(&flow_id);
-            });
+            let task = tcp_flow_tasks_for_accept.spawn_on(
+                async move {
+                    let _permit = permit;
+                    dispatch_tcp(stream, local_addr, remote_addr, state_for_task).await;
+                    tcp_flows().remove(&flow_id);
+                },
+                &engine_handle_for_tcp,
+            );
             let abort = task.abort_handle();
             tcp_flows().insert(
                 flow_id,
@@ -849,6 +885,7 @@ async fn run_tun2socks(
     let udp_reply_tx_accept = udp_reply_tx.clone();
     let reply_readers_accept = reply_readers.clone();
     let udp_sem_accept = udp_sem.clone();
+    let engine_handle_for_udp = crate::get_engine_runtime().handle().clone();
     let udp_accept_handle = tokio::spawn(async move {
         while let Some((payload, src, dst)) = udp_read.next().await {
             let permit = match udp_sem_accept.clone().try_acquire_owned() {
@@ -863,7 +900,7 @@ async fn run_tun2socks(
             };
             let reply_tx = udp_reply_tx_accept.clone();
             let readers = reply_readers_accept.clone();
-            tokio::spawn(async move {
+            engine_handle_for_udp.spawn(async move {
                 dispatch_udp(payload, src, dst, reply_tx, readers, permit).await;
             });
         }
@@ -910,7 +947,7 @@ async fn run_tun2socks(
             };
             let request = ip_data;
             let egress = egress_tx.clone();
-            tokio::spawn(async move {
+            crate::get_engine_runtime().spawn(async move {
                 let _permit = permit;
                 let work = async {
                     let Some(parsed) = parse_udp_packet(&request) else {
@@ -931,6 +968,21 @@ async fn run_tun2socks(
                         // dial. Empty-answer (not a silent drop) so clients
                         // fall back to A immediately instead of waiting out
                         // resolver timeouts.
+                        let Some(bytes) = dns_empty_response(parsed.payload) else {
+                            return;
+                        };
+                        bytes
+                    } else if block_http3() && matches!(qtype, Some(64) | Some(65)) {
+                        // "Block HTTP/3 (QUIC)" toggle ON: answer SVCB (64) /
+                        // HTTPS (65) NOERROR-empty by the intercept itself,
+                        // exactly like the AAAA arm above, instead of delegating
+                        // to meow-dns. The record's mere existence advertises h3
+                        // capability (its `alpn`/SvcParams carry the HTTP/3
+                        // hints), so hiding it entirely — not just stripping the
+                        // ipv4hint/ipv6hint as the meow-dns path does — drives the
+                        // client onto the A / fake-IPv4 + TCP path. Pairs with the
+                        // UDP/443 egress drop so any QUIC that still attempts is
+                        // also killed.
                         let Some(bytes) = dns_empty_response(parsed.payload) else {
                             return;
                         };
@@ -1413,6 +1465,20 @@ async fn dispatch_udp(
         return;
     };
 
+    // "Block HTTP/3 (QUIC)" toggle: drop outbound UDP to port 443 (QUIC's
+    // transport). `dst` is still the fake-IP:port from the tun (pre-rewrite),
+    // but `dst.port()` is the real app-intended port, so port-only matching is
+    // correct and address-independent. Returning here drops the datagram and
+    // lets `permit` fall out of scope, releasing its `udp_sem` slot — no live
+    // session is created, matching every other early-return path below.
+    if block_http3() && dst.port() == 443 {
+        warn_capped(
+            &BLOCK_HTTP3_DROP_LOG_LAST_MS,
+            "tun2socks: block-HTTP3 on, dropping outbound UDP/443 (QUIC)",
+        );
+        return;
+    }
+
     // No FFI-side fake-IP reverse: pass `dst.ip()` through and let meow's
     // `pre_handle_metadata` rewrite to the qname when the destination is
     // inside the resolver's fake-IP pool, exactly like the TCP path.
@@ -1533,7 +1599,7 @@ fn spawn_udp_reply_reader(
     tunnel_inner: Arc<TunnelInner>,
     permit: OwnedSemaphorePermit,
 ) {
-    tokio::spawn(async move {
+    crate::get_engine_runtime().spawn(async move {
         // Hold the `udp_sem` permit for the entire reader lifetime so the
         // semaphore caps live sessions, not just the dispatch window. Released
         // (along with this flow's NAT + reply_readers entries) only when the

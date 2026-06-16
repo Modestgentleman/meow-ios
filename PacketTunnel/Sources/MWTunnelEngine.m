@@ -4,6 +4,7 @@
 #import "MWPacketWriter.h"
 #import "MWSharedStore.h"
 #import "MWDarwinBridge.h"
+#import "MWEngineLog.h"
 #import "meow_core.h"
 #import <stdatomic.h>
 #import <os/log.h>
@@ -110,6 +111,13 @@ static const NSTimeInterval kTeardownCooldownS = 5.0;
         return NO;
     }
 
+    // Apply the Block HTTP/3 (QUIC) toggle before starting the tun. The Rust
+    // setter persists in tun2socks static state, so a single pre-start call
+    // covers both the initial meow_tun_start below and any later -resumeTun.
+    // When the toggle is off this passes 0, which is the engine's default —
+    // behavior is unchanged.
+    meow_tun_set_block_http3(prefs.blockHTTP3 ? 1 : 0);
+
     MWPacketWriter *writer = [[MWPacketWriter alloc] initWithFlow:_flow];
     _writer    = writer;
     _writerCtx = (void *)CFBridgingRetain(writer);
@@ -179,6 +187,7 @@ static const NSTimeInterval kTeardownCooldownS = 5.0;
     _tunStarted = NO;
 
     os_log_info(gLog, "engine: tun suspended (engine still running)");
+    MWEngineLog(MWLogInfo, @"NE: tun suspended (engine still running)");
 }
 
 - (void)resumeTun {
@@ -189,6 +198,8 @@ static const NSTimeInterval kTeardownCooldownS = 5.0;
     if (rc != 0) {
         os_log_error(gLog, "engine: tun resume failed: %{public}@",
                      [self lastRustError] ?: @"unknown");
+        MWEngineLogf(MWLogError, @"NE: tun resume failed: %@",
+                     [self lastRustError] ?: @"unknown");
         return;
     }
     _tunStarted = YES;
@@ -196,6 +207,7 @@ static const NSTimeInterval kTeardownCooldownS = 5.0;
     [self startIngressLoop];
     [self startTrafficPump];
     os_log_info(gLog, "engine: tun resumed");
+    MWEngineLog(MWLogInfo, @"NE: tun resumed");
 }
 
 // MARK: - Engine state

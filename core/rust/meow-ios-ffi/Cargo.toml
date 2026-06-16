@@ -32,7 +32,13 @@ dashmap = "6"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `fmt` powers the App Group file-log layer (file_log.rs); `env-filter` is the
+# pre-existing broadcast/oslog filter surface.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Off-hot-path, bounded, lossy file writer for the always-on debug ring. The
+# worker thread keeps the wedge-prone tokio workers off disk I/O so a livelock
+# never blocks on logging (see project_lwip_timer_livelock).
+tracing-appender = "0.2"
 log = "0.4"
 oslog = { version = "0.2", default-features = false, features = ["logger"] }
 
@@ -130,4 +136,4 @@ panic = "abort"
 # Upstream all of this to https://github.com/ssrlive/lwip and drop the
 # patch once a fixed release ships.
 [patch.crates-io]
-lwip = { git = "https://github.com/madeye/lwip", rev = "1dd61a5bfd9763f7d578a3d3bdaab0dae55cbc00" }
+lwip = { git = "https://github.com/madeye/lwip", rev = "78566b68b453f079cca42860f037de47248ec96e" }
