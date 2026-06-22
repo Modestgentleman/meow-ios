@@ -9,28 +9,23 @@ workflows:
       xcode: latest
 
     scripts:
-      - name: Show repository structure
+      - name: Resolve Swift Packages
         script: |
-          pwd
-          echo "========== ROOT =========="
-          ls -la
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project meow-ios.xcodeproj
 
-          echo "========== XCODE FILES =========="
-          find . -name "*.xcodeproj"
-          find . -name "*.xcworkspace"
-
-      - name: Show schemes
+      - name: Build App (No Sign)
         script: |
-          PROJECT=$(find . -name "*.xcodeproj" | head -n 1)
-
-          if [ -z "$PROJECT" ]; then
-            echo "No .xcodeproj found"
-            exit 1
-          fi
-
-          echo "Project: $PROJECT"
-
-          xcodebuild -list -project "$PROJECT"
+          xcodebuild \
+            -project meow-ios.xcodeproj \
+            -scheme meow-ios \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
     artifacts:
+      - "**/*.app"
+      - "**/*.xcarchive"
       - "**/*.xcresult"
