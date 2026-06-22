@@ -1,0 +1,57 @@
+workflows:
+  ios-build:
+    name: Meow iOS Build (No Sign)
+
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+
+    environment:
+      xcode: latest
+      cocoapods: default
+
+    scripts:
+      - name: Check project structure
+        script: |
+          pwd
+          ls -la
+
+      - name: Install dependencies
+        script: |
+          if [ -f Podfile ]; then
+            pod install || pod install --repo-update
+          fi
+
+      - name: Detect workspace or project
+        script: |
+          echo "Searching for Xcode project..."
+          find . -name "*.xcworkspace" -o -name "*.xcodeproj"
+
+      - name: Build iOS app (NO SIGN)
+        script: |
+          if ls *.xcworkspace 1> /dev/null 2>&1; then
+            WORKSPACE=$(ls *.xcworkspace | head -n 1)
+            echo "Using workspace: $WORKSPACE"
+
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -scheme Meow \
+              -configuration Release \
+              -sdk iphoneos \
+              build \
+              CODE_SIGNING_ALLOWED=NO
+
+          else
+            PROJECT=$(ls *.xcodeproj | head -n 1)
+            echo "Using project: $PROJECT"
+
+            xcodebuild \
+              -project "$PROJECT" \
+              -scheme Meow \
+              -configuration Release \
+              -sdk iphoneos \
+              build \
+              CODE_SIGNING_ALLOWED=NO
+          fi
+
+    artifacts:
+      - build/**/*.app
