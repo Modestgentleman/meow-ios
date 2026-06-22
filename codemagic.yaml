@@ -1,21 +1,83 @@
 workflows:
-  ios-build:
-    name: Meow iOS Build
+  ios-stable:
+    name: Meow iOS Stable Build
 
     max_build_duration: 120
     instance_type: mac_mini_m2
 
     environment:
       xcode: latest
+      cocoapods: default
 
     scripts:
-      - name: Resolve Swift Packages
-        script: |
-          xcodebuild \
-            -resolvePackageDependencies \
-            -project meow-ios.xcodeproj
 
-      - name: Build App (No Sign)
+      # =========================
+      # 1. Rust 环境（关键）
+      # =========================
+      - name: Setup Rust toolchain
+        script: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source $HOME/.cargo/env
+
+          rustup target add aarch64-apple-ios
+          rustup target add aarch64-apple-ios-sim
+          rustup target add x86_64-apple-ios
+
+          cargo install cbindgen
+
+      # =========================
+      # 2. Xcode toolchain（关键）
+      # =========================
+      - name: Setup iOS build env
+        script: |
+          export CC="$(xcrun -find clang)"
+          export CXX="$(xcrun -find clang++)"
+          export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export IPHONEOS_DEPLOYMENT_TARGET=17.0
+
+          echo "CC=$CC"
+          echo "SDK=$SDKROOT"
+
+      # =========================
+      # 3. 修复 submodule（防 SSH 崩）
+      # =========================
+      - name: Fix git submodules
+        script: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com:"
+          git submodule update --init --recursive || true
+
+      # =========================
+      # 4. 构建 Rust XCFramework（核心）
+      # =========================
+      - name: Build MeowCore XCFramework
+        script: |
+          chmod +x scripts/build-rust.sh
+          ./scripts/build-rust.sh
+
+      # =========================
+      # 5. 验证 XCFramework
+      # =========================
+      - name: Verify MeowCore
+        script: |
+          ls -R MeowCore/Frameworks || true
+          test -d MeowCore/Frameworks/MeowCore.xcframework
+
+      # =========================
+      # 6. CocoaPods（如果存在）
+      # =========================
+      - name: Install dependencies
+        script: |
+          if [ -f ios/Podfile ]; then
+            cd ios
+            pod install || pod repo update
+            cd ..
+          fi
+
+      # =========================
+      # 7. Build iOS App
+      # =========================
+      - name: Build iOS App (NO SIGN)
         script: |
           xcodebuild \
             -project meow-ios.xcodeproj \
@@ -23,9 +85,25 @@ workflows:
             -configuration Release \
             -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            clean build
+
+      # =========================
+      # 8. 打包 IPA
+      # =========================
+      - name: Package IPA
+        script: |
+          mkdir -p Payload
+
+          APP_PATH=$(find build -name "*.app" | head -n 1)
+
+          echo "App found at: $APP_PATH"
+
+          cp -r "$APP_PATH" Payload/
+
+          zip -r Meow.ipa Payload
 
     artifacts:
-      - "**/*.app"
-      - "**/*.xcarchive"
-      - "**/*.xcresult"
+      - Meow.ipa
+      - build/**/*.xcarchive
+      - build/**/*.app
+      - MeowCore/Frameworks/MeowCore.xcframework
