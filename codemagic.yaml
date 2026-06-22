@@ -1,57 +1,36 @@
 workflows:
   ios-build:
-    name: Meow iOS Build (No Sign)
+    name: Meow iOS Build
 
     max_build_duration: 120
     instance_type: mac_mini_m2
 
     environment:
       xcode: latest
-      cocoapods: default
 
     scripts:
-      - name: Check project structure
+      - name: Show repository structure
         script: |
           pwd
+          echo "========== ROOT =========="
           ls -la
 
-      - name: Install dependencies
+          echo "========== XCODE FILES =========="
+          find . -name "*.xcodeproj"
+          find . -name "*.xcworkspace"
+
+      - name: Show schemes
         script: |
-          if [ -f Podfile ]; then
-            pod install || pod install --repo-update
+          PROJECT=$(find . -name "*.xcodeproj" | head -n 1)
+
+          if [ -z "$PROJECT" ]; then
+            echo "No .xcodeproj found"
+            exit 1
           fi
 
-      - name: Detect workspace or project
-        script: |
-          echo "Searching for Xcode project..."
-          find . -name "*.xcworkspace" -o -name "*.xcodeproj"
+          echo "Project: $PROJECT"
 
-      - name: Build iOS app (NO SIGN)
-        script: |
-          if ls *.xcworkspace 1> /dev/null 2>&1; then
-            WORKSPACE=$(ls *.xcworkspace | head -n 1)
-            echo "Using workspace: $WORKSPACE"
-
-            xcodebuild \
-              -workspace "$WORKSPACE" \
-              -scheme Meow \
-              -configuration Release \
-              -sdk iphoneos \
-              build \
-              CODE_SIGNING_ALLOWED=NO
-
-          else
-            PROJECT=$(ls *.xcodeproj | head -n 1)
-            echo "Using project: $PROJECT"
-
-            xcodebuild \
-              -project "$PROJECT" \
-              -scheme Meow \
-              -configuration Release \
-              -sdk iphoneos \
-              build \
-              CODE_SIGNING_ALLOWED=NO
-          fi
+          xcodebuild -list -project "$PROJECT"
 
     artifacts:
-      - build/**/*.app
+      - "**/*.xcresult"
