@@ -10,9 +10,12 @@
 # `fastlane deliver` can upload it (deliver categorizes by pixel size).
 #
 # Prereq: build the app for the simulator first, e.g.
-#   xcodebuild build -scheme meow-ios -configuration Debug \
+#   xcodebuild build -allowProvisioningUpdates -xcconfig Local.xcconfig \
+#     -project meow-ios.xcodeproj -scheme meow-ios -configuration Debug \
 #     -destination 'generic/platform=iOS Simulator' \
-#     -derivedDataPath build/DerivedData-snapshot CODE_SIGNING_ALLOWED=NO
+#     -derivedDataPath build/DerivedData-snapshot DEVELOPMENT_TEAM=32B45SMMQL
+# Keep simulator signing enabled: App Group entitlements are required even
+# though the packet tunnel itself is mocked in simulator builds.
 # No `set -e`: simulator boot/install/launch return transient non-zero codes we
 # tolerate (we verify success by the captured PNG instead).
 set -uo pipefail
@@ -33,7 +36,7 @@ DEVICE_NAMES=("iPhone 17 Pro Max" "iPad Pro 13-inch (M5)")
 # locale -> AppleLanguages token
 LOCALES=("en-US" "zh-Hans")
 # NN<Screen>:tab-tag
-SCREENS=("01Home:home" "02Subscriptions:subscriptions" "03Traffic:traffic" "04Settings:settings")
+SCREENS=("01Subscriptions:subscriptions" "02ProxyGroups:proxyGroups" "03Traffic:traffic" "04Settings:settings")
 
 udid_for() { xcrun simctl list devices available | grep -F "$1 (" | head -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/'; }
 
